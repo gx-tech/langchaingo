@@ -3,6 +3,8 @@ package ollama
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/goccy/go-json"
 
 	"github.com/tmc/langchaingo/callbacks"
 	"github.com/tmc/langchaingo/llms"
@@ -61,6 +63,9 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		model = opts.Model
 	}
 
+	// Add tools provided in the options.
+	tools := toolsToTools(opts.Tools)
+
 	// Our input is a sequence of MessageContent, each of which potentially has
 	// a sequence of Part that could be text, images etc.
 	// We have to convert it to a format Ollama undestands: ChatRequest, which
@@ -75,6 +80,7 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		var text string
 		foundText := false
 		var images []ollamaclient.ImageData
+		var toolCalls []ollamaclient.ToolCall
 
 		for _, p := range mc.Parts {
 			switch pt := p.(type) {
@@ -86,6 +92,20 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 				text = pt.Text
 			case llms.BinaryContent:
 				images = append(images, ollamaclient.ImageData(pt.Data))
+			case llms.ToolCall:
+				var args map[string]interface{}
+				err := json.Unmarshal([]byte(pt.FunctionCall.Arguments), &args)
+				if err != nil {
+					return nil, fmt.Errorf("unmarshalling tool arguments: %w", err)
+				}
+				toolCalls = append(toolCalls, ollamaclient.ToolCall{
+					Function: ollamaclient.ToolCallFunction{
+						Name:      pt.FunctionCall.Name,
+						Arguments: args,
+					},
+				})
+			case llms.ToolCallResponse:
+				text = pt.Content
 			default:
 				return nil, errors.New("only support Text and BinaryContent parts right now")
 			}
@@ -93,6 +113,7 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 
 		msg.Content = text
 		msg.Images = images
+		msg.ToolCalls = toolCalls
 		chatMsgs = append(chatMsgs, msg)
 	}
 
@@ -108,7 +129,8 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		Format:   format,
 		Messages: chatMsgs,
 		Options:  ollamaOptions,
-		Stream:   opts.StreamingFunc != nil,
+		Stream:   false,
+		Tools:    tools,
 	}
 
 	keepAlive := o.options.keepAlive
@@ -119,6 +141,7 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 	var fn ollamaclient.ChatResponseFunc
 	streamedResponse := ""
 	var resp ollamaclient.ChatResponse
+	var toolCalls []ollamaclient.ToolCall
 
 	fn = func(response ollamaclient.ChatResponse) error {
 		if opts.StreamingFunc != nil && response.Message != nil {
@@ -128,12 +151,16 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		}
 		if response.Message != nil {
 			streamedResponse += response.Message.Content
+			if len(response.Message.ToolCalls) > 0 {
+				toolCalls = append(toolCalls, response.Message.ToolCalls...)
+			}
 		}
 		if !req.Stream || response.Done {
 			resp = response
 			resp.Message = &ollamaclient.Message{
-				Role:    "assistant",
-				Content: streamedResponse,
+				Role:      "assistant",
+				Content:   streamedResponse,
+				ToolCalls: toolCalls,
 			}
 		}
 		return nil
@@ -147,9 +174,15 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		return nil, err
 	}
 
+	llmToolCalls, err := toolCallsToToolCalls(toolCalls)
+	if err != nil {
+		return nil, err
+	}
+
 	choices := []*llms.ContentChoice{
 		{
-			Content: resp.Message.Content,
+			Content:   resp.Message.Content,
+			ToolCalls: llmToolCalls,
 			GenerationInfo: map[string]any{
 				"CompletionTokens": resp.EvalCount,
 				"PromptTokens":     resp.PromptEvalCount,
@@ -229,4 +262,36 @@ func makeOllamaOptionsFromOptions(ollamaOptions ollamaclient.Options, opts llms.
 	ollamaOptions.PresencePenalty = float32(opts.PresencePenalty)
 
 	return ollamaOptions
+}
+
+func toolsToTools(tools []llms.Tool) []ollamaclient.Tool {
+	toolReq := make([]ollamaclient.Tool, len(tools))
+	for i, tool := range tools {
+		toolReq[i] = ollamaclient.Tool{
+			Type: ollamaclient.ToolTypeFunction,
+			Function: ollamaclient.ToolFunction{
+				Name:        tool.Function.Name,
+				Description: tool.Function.Description,
+				Parameters:  tool.Function.Parameters,
+			},
+		}
+	}
+	return toolReq
+}
+
+func toolCallsToToolCalls(toolCalls []ollamaclient.ToolCall) ([]llms.ToolCall, error) {
+	tc := make([]llms.ToolCall, len(toolCalls))
+	for i, toolCall := range toolCalls {
+		argsJson, err := json.Marshal(toolCall.Function.Arguments)
+		if err != nil {
+			return nil, err
+		}
+		tc[i] = llms.ToolCall{
+			FunctionCall: &llms.FunctionCall{
+				Name:      toolCall.Function.Name,
+				Arguments: string(argsJson),
+			},
+		}
+	}
+	return tc, nil
 }
